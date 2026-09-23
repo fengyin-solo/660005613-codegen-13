@@ -12,6 +12,9 @@
           <el-option value="fifo" label="FIFO"/><el-option value="priority" label="优先级"/><el-option value="max_concurrent" label="最大并发"/>
         </el-select>
         <el-button type="success" size="small" @click="run" :disabled="!store.workflow" :loading="store.loading">▶ 执行</el-button>
+        <el-divider direction="vertical" />
+        <el-button type="primary" size="small" @click="openExport">📤 结果导出</el-button>
+        <el-button size="small" @click="openRecords">🗂 导出记录</el-button>
         <span class="ws-dot" :class="{on:store.wsConnected}"></span>
       </div>
     </header>
@@ -24,6 +27,8 @@
         <CircuitBreakerPanel />
       </div>
     </div>
+    <ExportDialog ref="exportDialog" />
+    <ExportRecordsDialog ref="recordsDialog" />
   </div>
 </template>
 
@@ -32,12 +37,22 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import DAGCanvas from './components/DAGCanvas.vue'
 import LogPanel from './components/LogPanel.vue'
 import CircuitBreakerPanel from './components/CircuitBreakerPanel.vue'
+import ExportDialog from './components/ExportDialog.vue'
+import ExportRecordsDialog from './components/ExportRecordsDialog.vue'
 import { useDAGStore } from './store/dag'
 const store = useDAGStore()
 const wfName = ref('data-pipeline')
+const exportDialog = ref<InstanceType<typeof ExportDialog>>()
+const recordsDialog = ref<InstanceType<typeof ExportRecordsDialog>>()
 function create() { store.createWorkflow(wfName.value) }
 function run() { store.run() }
-onMounted(() => store.connectWS())
+function openExport() { if (exportDialog.value) exportDialog.value.visible = true }
+function openRecords() { if (recordsDialog.value) recordsDialog.value.visible = true }
+onMounted(() => {
+  store.connectWS()
+  store.fetchRuns().catch(() => {})
+  store.fetchStages().catch(() => {})
+})
 onUnmounted(() => store.disconnectWS())
 </script>
 

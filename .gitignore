@@ -234,3 +234,15 @@ sandbox/
 *.pid
 *.seed
 *.pid.lock
+
+# =========================
+# Local Python 3.11 venv (this workspace)
+# =========================
+.venv311/
+.venv-linux/
+.venv-linux/
+
+# =========================
+# Workflow engine runtime data
+# =========================
+backend/data/
