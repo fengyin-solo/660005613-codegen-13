@@ -1,22 +1,66 @@
-import asyncio, time, random, json, threading
+import asyncio
+import json
+import os
+import random
+import threading
+import time
 from collections import defaultdict, deque
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from contextlib import asynccontextmanager
+from typing import List, Optional
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="DAG Workflow Engine")
+from . import database as db
+from . import exporting
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global LOOP
+    db.init_db()
+    exporting.cleanup_temp_files()
+    LOOP = asyncio.get_running_loop()
+    yield
+
+
+app = FastAPI(title="DAG Workflow Engine", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-ACTIVE_CLIENTS = []
+ACTIVE_CLIENTS: List[WebSocket] = []
 WORKFLOW_ID = 0
+# Event loop of the web server, captured at startup. Worker threads need it to
+# push WebSocket messages back onto the loop.
+LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global LOOP
+    db.init_db()
+    exporting.cleanup_temp_files()
+    LOOP = asyncio.get_running_loop()
+    yield
+
+
 
 class WorkflowCreate(BaseModel):
     name: str = "data-pipeline"
+
 
 class RunRequest(BaseModel):
     workflowId: int
     workers: int = 3
     strategy: str = "fifo"
+
+
+class ExportRequest(BaseModel):
+    runIds: List[int]
+    sections: List[str] = ["workflow", "tasks", "logs", "breakers"]
+    startTs: Optional[float] = None
+    endTs: Optional[float] = None
 
 
 def generate_dag_workflow(name: str):
@@ -70,15 +114,19 @@ def create_workflow(req: WorkflowCreate):
 @app.post("/api/run")
 def run_workflow(req: RunRequest):
     dag = generate_dag_workflow("workflow")
-    t = threading.Thread(target=execute_workflow, args=(dag, req.workers, req.strategy), daemon=True)
+    run_id = db.create_run(req.workflowId, "workflow", req.workers, req.strategy, dag, time.time())
+    t = threading.Thread(target=execute_workflow,
+                         args=(run_id, req.workflowId, dag, req.workers, req.strategy),
+                         daemon=True)
     t.start()
     return {
+        "runId": run_id,
         "workflow": {"id": req.workflowId, "name": "workflow", "nodes": dag["nodes"], "edges": dag["edges"]},
-        "logs": [], "circuitBreakers": [], "completed": False
+        "logs": [], "circuitBreakers": [], "completed": False, "status": "RUNNING"
     }
 
 
-def execute_workflow(dag, workers, strategy):
+def execute_workflow(run_id, workflow_id, dag, workers, strategy):
     nodes = dag["nodes"]
     durations = dag["durations"]
     edges = dag["edges"]
@@ -96,17 +144,40 @@ def execute_workflow(dag, workers, strategy):
     failure_threshold = 3
     running_tasks = {}
     completed = set()
+    terminally_failed = set()
+    start_ts = time.time()
+    last_save = [start_ts]
 
-    def send_update(completed_flag=False):
+    def breaker_payload():
+        return [{"taskId": k, **v} for k, v in cb_state.items()]
+
+    def send_update(completed_flag=False, status="RUNNING", force_save=False):
         payload = {
-            "workflow": {"id": 1, "name": "workflow", "nodes": nodes, "edges": edges},
+            "runId": run_id,
+            "workflow": {"id": workflow_id, "name": "workflow", "nodes": nodes, "edges": edges},
             "logs": logs[-30:],
-            "circuitBreakers": [{"taskId": k, **v} for k, v in cb_state.items()],
-            "completed": completed_flag
+            "circuitBreakers": breaker_payload(),
+            "completed": completed_flag,
+            "status": status,
         }
+        dead = []
         for ws in ACTIVE_CLIENTS:
-            try: asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(payload)), asyncio.get_event_loop())
-            except: pass
+            try:
+                if LOOP is not None:
+                    asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(payload)), LOOP)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            if ws in ACTIVE_CLIENTS:
+                ACTIVE_CLIENTS.remove(ws)
+        # Persist snapshots a few times per run so a refresh mid-run still
+        # shows progress; the final snapshot is always written.
+        now = time.time()
+        if force_save or now - last_save[0] >= 2:
+            db.update_run_snapshot(run_id, nodes, edges, logs, breaker_payload(),
+                                   status, completed_flag,
+                                   now if completed_flag else None)
+            last_save[0] = now
         time.sleep(0.3)
 
     while ready or running_tasks:
@@ -117,7 +188,7 @@ def execute_workflow(dag, workers, strategy):
             cb = cb_state[tid]
             if cb["state"] == "OPEN" and time.time() < cb["cooldownUntil"]:
                 ready.appendleft(tid)
-                continue
+                break
             if cb["state"] == "OPEN":
                 cb["state"] = "HALF_OPEN"
 
@@ -151,6 +222,15 @@ def execute_workflow(dag, workers, strategy):
                         cb["state"] = "OPEN"
                         cb["cooldownUntil"] = now + 5
                         logs.append({"taskId": tid, "status": "CIRCUIT_OPEN", "timestamp": now, "message": f"熔断! {failure_threshold}次连续失败"})
+                elif info["will_fail"]:
+                    # Retries exhausted: terminal failure. Downstream tasks can
+                    # never become ready; the loop drains and they are SKIPPED.
+                    node["status"] = "FAILED"
+                    node["endTime"] = now
+                    terminally_failed.add(tid)
+                    cb_state[tid]["state"] = "OPEN"
+                    cb_state[tid]["cooldownUntil"] = now + 5
+                    logs.append({"taskId": tid, "status": "FAILED", "timestamp": now, "message": f"执行失败 {node['name']}（已重试{node['retries']}次）"})
                 else:
                     node["status"] = "SUCCESS"
                     node["endTime"] = now
@@ -168,10 +248,193 @@ def execute_workflow(dag, workers, strategy):
             del running_tasks[tid]
 
         send_update()
-        if len(completed) == len(nodes):
-            break
 
-    send_update(True)
+    # Anything never started was unreachable due to an upstream failure.
+    for n in nodes:
+        if n["status"] == "PENDING":
+            n["status"] = "SKIPPED"
+
+    final_status = "FAILED" if terminally_failed else "SUCCESS"
+    send_update(True, status=final_status, force_save=True)
+
+
+# ------------------------------------------------------------- run history
+
+@app.get("/api/runs")
+def list_runs():
+    return db.list_runs()
+
+
+@app.get("/api/runs/{run_id}")
+def get_run(run_id: int):
+    row = db.get_run_row(run_id)
+    if row is None:
+        raise HTTPException(404, f"执行 #{run_id} 不存在")
+    return db.run_detail(row)
+
+
+# ---------------------------------------------------------------- exports
+
+def _normalize_or_400(req: ExportRequest):
+    try:
+        return exporting.normalize_scope(req.runIds, req.sections, req.startTs, req.endTs)
+    except exporting.ExportError as e:
+        raise HTTPException(400, str(e))
+
+
+def _preview(req: ExportRequest):
+    run_ids, sections, st, et = _normalize_or_400(req)
+    try:
+        content = exporting.build_content(run_ids, sections, st, et)
+    except exporting.ExportError as e:
+        raise HTTPException(400, str(e))
+    per_run = []
+    for entry in content["runs"]:
+        per_run.append({
+            "runId": entry["runId"],
+            "name": entry["name"],
+            "status": entry["status"],
+            "counts": {
+                "workflow": 1 if "workflow" in entry else 0,
+                "tasks": len(entry.get("tasks", [])),
+                "logs": len(entry.get("logs", [])),
+                "breakers": len(entry.get("breakers", [])),
+            },
+        })
+    return run_ids, sections, st, et, content, per_run
+
+
+@app.post("/api/export-preview")
+def export_preview(req: ExportRequest):
+    """Dry-run the scope without writing anything."""
+    run_ids, sections, st, et, content, per_run = _preview(req)
+    return {"counts": content["counts"], "hasData": content["_hasData"],
+            "runs": per_run}
+
+
+@app.post("/api/exports")
+def create_export(req: ExportRequest):
+    """Create (or reuse) an export. Same scope -> same file, never duplicated."""
+    run_ids, sections, st, et, content, _ = _preview(req)
+    key = exporting.scope_key(run_ids, sections, st, et)
+    filename = f"export_{key}.json"
+
+    # Hold the scope lock across the lookup/insert so two identical concurrent
+    # requests collapse into one record (and one file). The worker thread
+    # releases the key when the job finishes; the early-return paths release
+    # it here.
+    if not exporting.try_acquire_scope(key):
+        existing = db.find_export_by_key(key)
+        if existing is not None:
+            return {"reused": True, "record": db.export_to_api(existing)}
+        raise HTTPException(409, "相同范围的导出正在创建中，请稍后查看导出记录")
+
+    existing = db.find_export_by_key(key)
+    if existing is not None:
+        status = existing["status"]
+        if status == "SUCCESS":
+            exporting.release_scope(key)
+            return {"reused": True, "record": db.export_to_api(existing)}
+        if status == "EMPTY" and not content["_hasData"]:
+            # Same conclusion still holds: keep the one record, no file.
+            exporting.release_scope(key)
+            return {"reused": True, "record": db.export_to_api(existing)}
+        # FAILED / interrupted PROCESSING / EMPTY-with-new-data: rearm the
+        # existing record instead of duplicating it; atomic_write guarantees
+        # no half file can remain. Worker thread releases the key on finish.
+        db.rearm_export(existing["id"])
+        try:
+            exporting.start_export_job(existing["id"], key, run_ids, sections,
+                                      st, et, filename)
+        except Exception:
+            exporting.release_scope(key)
+            raise
+        return {"reused": True,
+                "record": db.export_to_api(db.get_export_row(existing["id"]))}
+
+    try:
+        export_id = db.insert_export(key, run_ids, sections, st, et, filename,
+                                     time.time())
+        exporting.start_export_job(export_id, key, run_ids, sections, st, et, filename)
+    except Exception:
+        exporting.release_scope(key)
+        raise
+    return {"reused": False,
+            "record": db.export_to_api(db.get_export_row(export_id))}
+
+
+@app.get("/api/exports")
+def list_exports():
+    return [db.export_to_api(r) for r in db.list_export_rows()]
+
+
+@app.get("/api/exports/{export_id}")
+def get_export(export_id: int):
+    row = db.get_export_row(export_id)
+    if row is None:
+        raise HTTPException(404, "导出记录不存在")
+    record = db.export_to_api(row)
+    content = None
+    if row["status"] == "SUCCESS" and row["filename"]:
+        path = os.path.join(db.EXPORTS_DIR, row["filename"])
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                content = json.load(f)
+    # Detail page counts come straight from the written file — identical 口径
+    # to the export-record list.
+    return {"record": record, "content": content}
+
+
+@app.get("/api/exports/{export_id}/download")
+def download_export(export_id: int):
+    row = db.get_export_row(export_id)
+    if row is None:
+        raise HTTPException(404, "导出记录不存在")
+    if row["status"] != "SUCCESS":
+        raise HTTPException(409, "导出尚未完成或没有可下载的文件")
+    path = os.path.join(db.EXPORTS_DIR, row["filename"])
+    if not os.path.exists(path):
+        raise HTTPException(410, "导出文件不存在，请重新开始导出")
+    label = "_".join(str(i) for i in json.loads(row["run_ids_json"])[:5])
+    return FileResponse(
+        path,
+        media_type="application/json; charset=utf-8",
+        filename=f"execution_runs_{label}_{row['id']}.json",
+    )
+
+
+@app.post("/api/exports/{export_id}/retry")
+def retry_export(export_id: int):
+    """Restart an interrupted/failed/empty export; no partial file survives."""
+    row = db.get_export_row(export_id)
+    if row is None:
+        raise HTTPException(404, "导出记录不存在")
+    if row["status"] == "SUCCESS":
+        return {"record": db.export_to_api(row)}
+
+    run_ids = json.loads(row["run_ids_json"])
+    sections = json.loads(row["sections_json"])
+    st, et = row["start_ts"], row["end_ts"]
+    key = row["scope_key"]
+    filename = row["filename"]
+
+    if not exporting.try_acquire_scope(key):
+        raise HTTPException(409, "该导出正在进行中")
+    # Remove any partial artifact, then rearm the same record.
+    for suffix in ("", ".tmp"):
+        p = os.path.join(db.EXPORTS_DIR, (filename or "") + suffix)
+        if filename and os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    db.rearm_export(export_id)
+    try:
+        exporting.start_export_job(export_id, key, run_ids, sections, st, et, filename)
+    except Exception:
+        exporting.release_scope(key)
+        raise
+    return {"record": db.export_to_api(db.get_export_row(export_id))}
 
 
 @app.websocket("/ws")
@@ -179,6 +442,11 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     ACTIVE_CLIENTS.append(ws)
     try:
-        while True: await ws.receive_text()
-    except:
-        if ws in ACTIVE_CLIENTS: ACTIVE_CLIENTS.remove(ws)
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
+    except Exception:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)

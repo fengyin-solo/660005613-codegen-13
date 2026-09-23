@@ -12,6 +12,9 @@
           <el-option value="fifo" label="FIFO"/><el-option value="priority" label="优先级"/><el-option value="max_concurrent" label="最大并发"/>
         </el-select>
         <el-button type="success" size="small" @click="run" :disabled="!store.workflow" :loading="store.loading">▶ 执行</el-button>
+        <el-button size="small" @click="exportCurrent" :disabled="!store.currentRunId">📤 导出本次</el-button>
+        <el-button size="small" @click="openHistory">🕓 执行历史</el-button>
+        <el-button size="small" @click="openRecords" type="primary" plain>🗂 导出记录</el-button>
         <span class="ws-dot" :class="{on:store.wsConnected}"></span>
       </div>
     </header>
@@ -24,6 +27,10 @@
         <CircuitBreakerPanel />
       </div>
     </div>
+
+    <ExportDialog ref="exportDialog" @done="onExportDone" />
+    <ExportRecordsDialog ref="recordsDialog" />
+    <RunHistoryDialog ref="historyDialog" @export-runs="(ids) => exportDialog?.openPreset(ids)" />
   </div>
 </template>
 
@@ -32,13 +39,45 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import DAGCanvas from './components/DAGCanvas.vue'
 import LogPanel from './components/LogPanel.vue'
 import CircuitBreakerPanel from './components/CircuitBreakerPanel.vue'
+import ExportDialog from './components/ExportDialog.vue'
+import ExportRecordsDialog from './components/ExportRecordsDialog.vue'
+import RunHistoryDialog from './components/RunHistoryDialog.vue'
 import { useDAGStore } from './store/dag'
+import { useExportStore } from './store/export'
+import type { ExportRecord } from './types'
 const store = useDAGStore()
+const exportStore = useExportStore()
 const wfName = ref('data-pipeline')
+const exportDialog = ref<InstanceType<typeof ExportDialog>>()
+const recordsDialog = ref<InstanceType<typeof ExportRecordsDialog>>()
+const historyDialog = ref<InstanceType<typeof RunHistoryDialog>>()
 function create() { store.createWorkflow(wfName.value) }
 function run() { store.run() }
-onMounted(() => store.connectWS())
-onUnmounted(() => store.disconnectWS())
+function exportCurrent() {
+  if (store.currentRunId) exportDialog.value?.openPreset([store.currentRunId])
+}
+function openHistory() { historyDialog.value?.open() }
+function openRecords() { recordsDialog.value?.open() }
+function onExportDone(_record: ExportRecord) {
+  // New/restarted jobs: keep the records list tracking to completion even
+  // without opening the records dialog.
+  exportStore.loadExports().then(() => {
+    if (exportStore.exportsList.some(e => e.status === 'PROCESSING')) {
+      exportStore.startPolling(false)
+    }
+  })
+}
+onMounted(() => {
+  store.connectWS()
+  // Refresh recovery: any export still processing on the server is tracked;
+  // records themselves come from SQLite, so they remain viewable regardless.
+  exportStore.loadExports().then(() => {
+    if (exportStore.exportsList.some(e => e.status === 'PROCESSING')) {
+      exportStore.startPolling(false)
+    }
+  })
+})
+onUnmounted(() => { store.disconnectWS(); exportStore.stopPolling() })
 </script>
 
 <style>

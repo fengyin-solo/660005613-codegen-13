@@ -198,6 +198,11 @@ obj/
 *.sqlite
 *.sqlite3
 *.db
+*.db-wal
+*.db-shm
+
+# Runtime data for the workflow engine (persisted runs / export files)
+backend/data/
 
 # =========================
 # Test output
